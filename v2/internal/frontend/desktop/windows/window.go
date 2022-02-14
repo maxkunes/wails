@@ -3,8 +3,6 @@
 package windows
 
 import (
-	"fmt"
-	"log"
 	"syscall"
 	"unsafe"
 
@@ -43,7 +41,7 @@ func NewWindow(parent winc.Controller, appoptions *options.App) *Window {
 		exStyle |= w32.WS_EX_TOPMOST
 	}
 
-	var dwStyle = w32.WS_OVERLAPPEDWINDOW
+	var dwStyle = w32.WS_THICKFRAME | w32.WS_SYSMENU | w32.WS_MAXIMIZEBOX | w32.WS_MINIMIZEBOX
 
 	winc.RegClassOnlyOnce("wailsWindow")
 	result.SetHandle(winc.CreateWindow("wailsWindow", parent, uint(exStyle), uint(dwStyle)))
@@ -122,6 +120,11 @@ func (w *Window) SetMaxSize(maxWidth int, maxHeight int) {
 	w.Form.SetMaxSize(maxWidth, maxHeight)
 }
 
+type NCCALCSIZE_PARAMS struct {
+	rgrc  [3]w32.RECT
+	lppos uintptr /* WINDOWPOS */
+}
+
 func (w *Window) WndProc(msg uint32, wparam, lparam uintptr) uintptr {
 
 	switch msg {
@@ -146,16 +149,60 @@ func (w *Window) WndProc(msg uint32, wparam, lparam uintptr) uintptr {
 
 	if w.frontendOptions.Frameless {
 		switch msg {
-		case w32.WM_ACTIVATE:
-			// If we want to have a frameless window but with border, extend the client area outside of the window. This
-			// Option is not affected by returning 0 in WM_NCCALCSIZE.
-			// As a result we have hidden the titlebar but still have the default border drawn.
-			// See: https://docs.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmextendframeintoclientarea#remarks
-			if winoptions := w.frontendOptions.Windows; winoptions != nil && winoptions.EnableFramelessBorder {
-				if err := dwmExtendFrameIntoClientArea(w.Handle(), w32.MARGINS{-1, -1, -1, -1}); err != nil {
-					log.Fatal(fmt.Errorf("DwmExtendFrameIntoClientArea failed: %s", err))
+		case w32.WM_CREATE:
+
+			sizeRect := w32.GetWindowRect(w.Handle())
+
+			w32.SetWindowPos(w.Handle(), 0,
+				int(sizeRect.Left),
+				int(sizeRect.Top),
+				int(sizeRect.Right-sizeRect.Left),
+				int(sizeRect.Bottom-sizeRect.Top),
+				w32.SWP_FRAMECHANGED|w32.SWP_NOMOVE|w32.SWP_NOSIZE)
+
+			break
+		case w32.WM_NCHITTEST:
+			hit := w.Form.WndProc(msg, wparam, lparam)
+
+			switch hit {
+			case w32.HTNOWHERE:
+			case w32.HTRIGHT:
+			case w32.HTLEFT:
+			case w32.HTTOPLEFT:
+			case w32.HTTOP:
+			case w32.HTTOPRIGHT:
+			case w32.HTBOTTOMRIGHT:
+			case w32.HTBOTTOM:
+			case w32.HTBOTTOMLEFT:
+				return hit
+			}
+
+			monitor := w32.MonitorFromWindow(w.Handle(), w32.MONITOR_DEFAULTTONEAREST)
+			var monitorInfo w32.MONITORINFO
+			monitorInfo.CbSize = uint32(unsafe.Sizeof(monitorInfo))
+			if w32.GetMonitorInfo(monitor, &monitorInfo) {
+				maxWidth := w.frontendOptions.MaxWidth
+				maxHeight := w.frontendOptions.MaxHeight
+				if maxWidth > 0 || maxHeight > 0 {
+					var dpiX, dpiY uint
+					w32.GetDPIForMonitor(monitor, w32.MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
+
+					frameY := winc.ScaleWithDPI(w32.GetSystemMetrics(w32.SM_CYFRAME), dpiY)
+					padding := winc.ScaleWithDPI(w32.GetSystemMetrics(92 /*SM_CXPADDEDBORDER */), dpiX)
+
+					_, cursorY, ok := w32.ScreenToClient(w.Handle(), int(w32.LOWORD(uint32(lparam))), int(w32.HIWORD(uint32(lparam))))
+
+					if ok {
+						if cursorY > 0 && cursorY < frameY+padding {
+							return w32.HTTOP
+						}
+					}
+
 				}
 			}
+
+			return w32.HTCLIENT
+
 		case w32.WM_NCCALCSIZE:
 			// Disable the standard frame by allowing the client area to take the full
 			// window size.
@@ -164,33 +211,36 @@ func (w *Window) WndProc(msg uint32, wparam, lparam uintptr) uintptr {
 			// shown. We still need the WS_THICKFRAME style to enable resizing from the frontend.
 			if wparam != 0 {
 				style := uint32(w32.GetWindowLong(w.Handle(), w32.GWL_STYLE))
-				if style&w32.WS_MAXIMIZE != 0 {
-					// If the window is maximized we must adjust the client area to the work area of the monitor. Otherwise
-					// some content goes beyond the visible part of the monitor.
-					monitor := w32.MonitorFromWindow(w.Handle(), w32.MONITOR_DEFAULTTONEAREST)
 
-					var monitorInfo w32.MONITORINFO
-					monitorInfo.CbSize = uint32(unsafe.Sizeof(monitorInfo))
-					if w32.GetMonitorInfo(monitor, &monitorInfo) {
-						rgrc := (*w32.RECT)(unsafe.Pointer(lparam))
-						*rgrc = monitorInfo.RcWork
+				monitor := w32.MonitorFromWindow(w.Handle(), w32.MONITOR_DEFAULTTONEAREST)
 
-						maxWidth := w.frontendOptions.MaxWidth
-						maxHeight := w.frontendOptions.MaxHeight
-						if maxWidth > 0 || maxHeight > 0 {
-							var dpiX, dpiY uint
-							w32.GetDPIForMonitor(monitor, w32.MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
+				var monitorInfo w32.MONITORINFO
+				monitorInfo.CbSize = uint32(unsafe.Sizeof(monitorInfo))
+				if w32.GetMonitorInfo(monitor, &monitorInfo) {
+					maxWidth := w.frontendOptions.MaxWidth
+					maxHeight := w.frontendOptions.MaxHeight
+					if maxWidth > 0 || maxHeight > 0 {
+						var dpiX, dpiY uint
+						w32.GetDPIForMonitor(monitor, w32.MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
 
-							maxWidth := int32(winc.ScaleWithDPI(maxWidth, dpiX))
-							if maxWidth > 0 && rgrc.Right-rgrc.Left > maxWidth {
-								rgrc.Right = rgrc.Left + maxWidth
-							}
+						frameX := winc.ScaleWithDPI(w32.GetSystemMetrics(w32.SM_CXFRAME), dpiX)
+						frameY := winc.ScaleWithDPI(w32.GetSystemMetrics(w32.SM_CYFRAME), dpiY)
 
-							maxHeight := int32(winc.ScaleWithDPI(maxHeight, dpiY))
-							if maxHeight > 0 && rgrc.Bottom-rgrc.Top > maxHeight {
-								rgrc.Bottom = rgrc.Top + maxHeight
-							}
+						// should we scale with dpiX or dpiY?
+						padding := winc.ScaleWithDPI(w32.GetSystemMetrics(92 /*SM_CXPADDEDBORDER */), dpiX)
+
+						params := (*NCCALCSIZE_PARAMS)(unsafe.Pointer(lparam))
+
+						params.rgrc[0].Left += int32(frameX + padding)
+						params.rgrc[0].Right -= int32(frameX + padding)
+						params.rgrc[0].Bottom -= int32(frameY + padding)
+
+						if style&w32.WS_MAXIMIZE != 0 {
+							params.rgrc[0].Top += int32(padding)
 						}
+
+						return 0
+
 					}
 				}
 
@@ -203,8 +253,7 @@ func (w *Window) WndProc(msg uint32, wparam, lparam uintptr) uintptr {
 
 // TODO this should be put into the winc if we are happy with this solution.
 var (
-	modkernel32 = syscall.NewLazyDLL("dwmapi.dll")
-
+	modkernel32                      = syscall.NewLazyDLL("dwmapi.dll")
 	procDwmExtendFrameIntoClientArea = modkernel32.NewProc("DwmExtendFrameIntoClientArea")
 )
 
